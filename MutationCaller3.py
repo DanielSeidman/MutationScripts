@@ -94,6 +94,7 @@ def gather_likelihoods_for_variants(contig_iterator, outer_tree, seg_first_order
                 inner_tree = InnerTree(site_record)#builds a site-specific inner tree structure from the genotype calls at this site
                 likelihoods = []
                 likelihoods_to_print = str(site_record.POS)
+                structure.updateSegs(site_record.POS)
                 for sample in site_record.samples:
 
                     viewed_ids = set()
