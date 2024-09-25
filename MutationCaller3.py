@@ -8,6 +8,8 @@ import sys
 import numpy
 from numpy import exp
 from numpy import log1p
+from numpy import finfo
+
 import concurrent.futures
 
 #TODO: Handle Phase and IBD uncertainty better
@@ -45,20 +47,24 @@ def ibd_probability(ibdKnown, phased, distance, baseLikelihood):
 #Output;
 def read_likelihood(focal_allele, node_of_read_origin, ibd_likelihood, descendant):
     if(descendant and (focal_allele==node_of_read_origin.allele)):
+        #print((1.0-node_of_read_origin.hidden_var_error)*ibd_likelihood+node_of_read_origin.hidden_var_error*ibd_likelihood)
         return (1.0-node_of_read_origin.hidden_var_error)*ibd_likelihood+node_of_read_origin.hidden_var_error*ibd_likelihood
     elif(descendant and (focal_allele!=node_of_read_origin.allele)):
+        #print((1.0-node_of_read_origin.hidden_var_error)*(1-ibd_likelihood)+(node_of_read_origin.hidden_var_error)*ibd_likelihood)
         return (1.0-node_of_read_origin.hidden_var_error)*(1-ibd_likelihood)+(node_of_read_origin.hidden_var_error)*ibd_likelihood
     elif((not descendant) and (focal_allele==node_of_read_origin.allele)):
+        #print((1.0-node_of_read_origin.hidden_var_error)*(1-ibd_likelihood)+(node_of_read_origin.hidden_var_error)*ibd_likelihood)
         return (1.0-node_of_read_origin.false_var_error)*(1-ibd_likelihood)+(node_of_read_origin.false_var_error)*ibd_likelihood
     else:#if(not descendent and (focal_allele!=node_of_read_origin.allele)
-        return (1-node_of_read_origin.false_var_error)
+        #print((1.0-node_of_read_origin.false_var_error))
+        return max((1.0-node_of_read_origin.false_var_error),finfo(float).tiny)
 
 #TODO: possibly set up cache memoization to take advantage of repeated calls. Needs to use non-recursive so that function calls can be separated from relative distance between nodes, making their output identical from repeated calls
 #Input:
 #Output
 def gatherLogLikelihood(viewed_ids, current_id, original_allele, original_id, original_haplotype, site, distance, descendent, outer_pedigree, inner_pedigree, seg_structure, ibd_error_rate):
     #EndCase, prevents redundent analysis
-    if (current_id == -1 or current_id in viewed_ids):
+    if (current_id == -1 or current_id == "0" or current_id in viewed_ids):
         return 0.0
     viewed_ids.add(current_id)
     log_likelihood = 0.0
@@ -68,16 +74,23 @@ def gatherLogLikelihood(viewed_ids, current_id, original_allele, original_id, or
         baseLikelihood = ibd_error_rate
         if(seg_structure.is_ibd(original_id, original_haplotype, current_id, read_haplotype, site)):
             baseLikelihood=1.0-baseLikelihood
-        ibd_likelihood = ibd_probability(True, inner_node.phased, distance, baseLikelihood)
+        ibd_likelihood = ibd_probability(True, inner_node.phase, distance, baseLikelihood)
         log_likelihood += inner_node.depth * math.log(read_likelihood(original_allele, inner_node, ibd_likelihood, descendent))
-    for parent in outer_pedigree[current_id].parents:#set descendent status to False when going into a parent
+    for parent in outer_pedigree.samples[current_id].parents:#set descendent status to False when going into a parent
         log_likelihood += gatherLogLikelihood(viewed_ids, parent, original_allele, original_id, original_haplotype, site, distance + 1, False, outer_pedigree, inner_pedigree, seg_structure, ibd_error_rate)
-    for child in outer_pedigree[current_id].children:
+    for child in outer_pedigree.samples[current_id].children:
         log_likelihood += gatherLogLikelihood(viewed_ids, child, original_allele, original_id, original_haplotype, site, distance + 1, descendent, outer_pedigree, inner_pedigree, seg_structure, ibd_error_rate)
     return log_likelihood#TODO Need to also return IBD presence in decendents to shore up IBD confidence concerns
 
 
-#In its final version, this is meant to be used by parallel processes. Currently, it is not.
+def run_parallel_likelihood_analysis(input_tuple):
+    search_range,outer_tree, vcf_file_name, seg_first_order_filename, seg_last_order_filename = input_tuple
+    with open(seg_first_order_filename) as first_ordered_file:
+        with open(seg_last_order_filename) as last_ordered_file:
+            structure = SegSiteStructure(first_ordered_file, last_ordered_file)#Starts a segment tracker for an efficient storage of IBD near the current site.
+            vcf_reader = vcf.Reader(filename="vcf_file_name")
+            iterator = vcf_reader.fetch(search_range[0], search_range[1], search_range[2])
+            gather_likelihoods_for_variants(iterator, outer_tree, structure)
 #Input:
 #contig_iterator; an iterator aimed at a range of sites within a tabix-indexed vcf. When parallelized, is one of many aimed at the same file
 #outer_tree; a tree containing sample names and parent/child relationships. When parallelized, all threads are looking at the same shared tree object.
@@ -86,31 +99,35 @@ def gatherLogLikelihood(viewed_ids, current_id, original_allele, original_id, or
 #q; the listener for parallel printing
 #Output:
 #None, but prints likelihood values per variant per sample, ordered in the same order as the input vcf, to a file. When parallelized, as a result of no control over which sites are finished first, the output is not ordered by site, and must be sorted in post-processing
-def gather_likelihoods_for_variants(contig_iterator, outer_tree, seg_first_order_filename, seg_last_order_filename, q):
-    with open(seg_first_order_filename) as first_ordered_file:
-        with open(seg_last_order_filename) as last_ordered_file:
-            structure = SegSiteStructure(first_ordered_file, last_ordered_file)#Starts a segment tracker for an efficient storage of IBD near the current site.
-            site_record = contig_iterator.next()
-            while(site_record):
-                inner_tree = InnerTree(site_record)#builds a site-specific inner tree structure from the genotype calls at this site
-                site_record = contig_iterator.next()
-                likelihoods_to_print = str(site_record.site)
-                for sample in site_record.samples:
+def gather_likelihoods_for_variants(contig_iterator, outer_tree, seg_structure):
+        for site_record in contig_iterator:
+            inner_tree = InnerTree(site_record)#builds a site-specific inner tree structure from the genotype calls at this site
+            likelihoods = []
+            likelihoods_to_print = str(site_record.POS)
+            seg_structure.update_segs(site_record.POS)
+            for sample in site_record.samples:
 
-                    viewed_ids = set()
-                    haplotype = 0
-                    original_node = inner_tree.map_to_inner_nodes[sample][haplotype]
-                    hap_likelihood_0 = gatherLogLikelihood(viewed_ids, sample, original_node.allele, sample, haplotype, site_record.site, 0, True, outer_tree, inner_tree, structure, ibd_error_rate_flat)
-                    viewed_ids = set()
-                    haplotype = 1
-                    original_node = inner_tree.map_to_inner_nodes[sample][haplotype]
-                    hap_likelihood_1 = gatherLogLikelihood(viewed_ids, sample, original_node.allele[haplotype], sample,
-                                                           haplotype, site_record.site, 0, True, outer_tree, inner_tree,
-                                                           structure, ibd_error_rate_flat)
+                viewed_ids = set()
+                haplotype = 0
+                original_node = inner_tree.map_to_inner_nodes[sample.sample][haplotype]
+                hap_likelihood_0 = gatherLogLikelihood(viewed_ids, sample.sample, original_node.allele, sample.sample, haplotype, site_record.POS, 0, True, outer_tree, inner_tree, seg_structure, ibd_error_rate_flat)
+                viewed_ids = set()
+                haplotype = 1
+                original_node = inner_tree.map_to_inner_nodes[sample.sample][haplotype]
+                hap_likelihood_1 = gatherLogLikelihood(viewed_ids, sample.sample, original_node.allele, sample.sample,
+                                                       haplotype, site_record.POS, 0, True, outer_tree, inner_tree,
+                                                       seg_structure, ibd_error_rate_flat)
 
-                    likelihoods_to_print += "\t{:.2f}".format(sum_log_prob(hap_likelihood_0,hap_likelihood_1))
+                #likelihoods_to_print += "\t{:.2f}".format(sum_log_prob(hap_likelihood_0,hap_likelihood_1))
+                likelihoods.append(sum_log_prob(hap_likelihood_0,hap_likelihood_1))
+            likelihood_sum=sum_log_prob(likelihoods[0],likelihoods[1])
+            for sample_index in range(2,len(likelihoods)):
+                likelihood_sum = sum_log_prob(likelihoods[sample_index], likelihood_sum)
+            for sample_index in range(0, len(likelihoods)):
+                likelihoods_to_print += "\t{:.2f}".format(likelihoods[sample_index]-likelihood_sum)
             print(likelihoods_to_print)
-            #q.put(likelihoods_to_print)
+
+
 
 #Contains identifying information to be able to add or remove IBD segments from the current site
 class Seg:
@@ -184,7 +201,7 @@ class SegSiteStructure:
         return line
 
     #Checks what segments overlap with current cite, adds and removes tracked segments as needed
-    def updateSegs(self, site):
+    def update_segs(self, site):
         last_ordered_line = self.peek_line_last()
         # Moves to first potentially overlapping segment, and attempts removal of any segments that no longer overlap after site update.
         while (last_ordered_line):
@@ -224,13 +241,16 @@ class OuterNode:
         self.name = name
         self.parents = set()
         self.children = set()
-
+        self.parents.add(mother)
+        self.parents.add(father)
 
     def add_child(self, child_name):
         self.children.add(child_name)
 
     def add_parent(self, parent_name):
         self.parents.add(parent_name)
+
+
 
 #Site, sample, and haplotype specific node class with depth and allele data. Remade for each site analyzed.
 #Represents a haplotype for a specific sample, and its allele controls what allele reads associated with it show for matching purposes
@@ -255,13 +275,12 @@ class InnerTree:
         self.map_to_inner_nodes = defaultdict(lambda: {}) #map of sample name to maps of haplotypes to inner nodes
         self.ordered_samples = []  # array for consistent ordered sample access based on the input file order
         for sample in data_entry.samples:
-            self.call_to_nodes(data_entry.samples[sample])
+            self.call_to_nodes(sample)
 
     #CURRENTLY ASSUMES BIALLELIC
     #loads a node for the inner tree using a call datapoint from the input record
     def call_to_nodes(self, input_call):
         name = input_call.sample
-        print(input_call.data)
         depth_values = input_call.data.AD
         pl_values = []
         self.ordered_samples.append(name)
@@ -272,6 +291,7 @@ class InnerTree:
             gq_value = input_call.data.GQ
             pl_values=[gq_value, gq_value, gq_value]
             pl_values[input_call.gt_type]=0#The GQ value is, in practice, the difference between the two most likely PL values, so the correct genotype should have a PL of zero, and the others should have GQ or higher.
+        #print(pl_values)
         if(input_call.gt_type==0):
             node = InnerNode(0, depth_values[0]/2, pl_values[1], pl_values[2])
             self.map_to_inner_nodes[name][0] = node
@@ -308,12 +328,16 @@ class OuterTree:
     #Does NOT check consistency for sex in input.
     def load_tree(self, treeFileName):
         with open(treeFileName) as treeFile:
-            self.sampleCount = 0
-            self.trueSampleCount = 0
+            childrenToAdd = defaultdict(lambda: set())
             for line in treeFile:
                 tokens = line.split()
                 self.samples[tokens[0]] = OuterNode(tokens[0],tokens[1],tokens[2])
-
+                childrenToAdd[tokens[1]].add(tokens[0])
+                childrenToAdd[tokens[2]].add(tokens[0])
+            for sample in childrenToAdd:
+                if(sample != "0"):#Avoids treating unknown parents as a sample
+                    for child in childrenToAdd[sample]:
+                        self.samples[sample].add_child(child)
 
 #input:
 #vcf_reader; iterator for the entire input
@@ -335,6 +359,11 @@ def vcf_to_range_list(vcf_reader, pool_count):
             continue
     return ranges
 
+def inputs_to_iterable_for_map(search_range, outer_tree, vcf_file_name, seg_first_order_filename, seg_last_order_filename):
+    arg_list = []
+    for range_tuple in search_range:
+        arg_list.append((range_tuple, outer_tree, vcf_file_name, seg_first_order_filename, seg_last_order_filename))
+    return arg_list
 
 #input:
 #vcf_reader; iterator for the entire input
@@ -388,38 +417,25 @@ def main():
     except:
         print("Usage: <tabixed vcf.gz file> <.ped file> <first ordered seg file> <last ordered seg file> <integer count of cores to use> <output filename>\nOrdered segment files can be generated with the double_seg_sorter.sh script using hapIBD formatted input")
         sys.exit(1)
-
+    outer_tree = OuterTree(tree_file_name)
     vcf_reader = vcf.Reader(filename=mutation_candidate_vcf_name)
     iterator_ranges = vcf_to_range_list(vcf_reader, pool_jobs)
-
+    inputs = inputs_to_iterable_for_map(iterator_ranges, outer_tree, mutation_candidate_vcf_name, seg_first_order_filename,
+                               seg_last_order_filename)
     with concurrent.futures.ProcessPoolExecutor(max_workers=pool_jobs) as executor:
         manager = mp.Manager()
         lock = manager.lock()
-        for range_val, call_count in zip(iterator_ranges, executor.map(get_call, iterator_ranges, lock)):
-            print(range_val, call_count)
 
-    outer_tree = OuterTree(tree_file_name)
+        for range_val, call_count in zip(iterator_ranges, executor.map(run_parallel_likelihood_analysis, inputs, lock)):
+            print("test", range_val, call_count)
 
-    vcf_reader = vcf.Reader(filename=mutation_candidate_vcf_name)
-    #gather_likelihoods_for_variants(vcf_reader, outer_tree, seg_first_order_filename, seg_last_order_filename, q)
 
 
     #TODO: The parallel process I was attempting here does not work, will replace with a placeholder that performs the same task shortly, then will repair the parallel version.
     #When working properly, splits up contigs into subregions, assigns iterators to each, then within each region, iterates site by site, using the segment updates to store overlapping subsets of IBD segments.
     #Then iterates over each sample, and performs the recursive likelihood function gatherLogLikelihood. For the current statistical model, it doesn't use reads from outside the subtree
 
-    # mp.set_start_method('spawn')
-    # manager = mp.Manager()
-    # pool = mp.Pool(processes=pool_jobs)
-    # q = manager.Queue()  # Used for multiprocess-safe printing to an output file.
-    # watcher = pool.apply_async(listener, (q, output_filename))
-    # vcf_reader = vcf.Reader(filename=mutation_candidate_vcf_name)
 
-    # iterators_for_pools = []
-
-    #q.put('kill')
-    #pool.close()
-    #pool.join()
 
 
 if __name__ == "__main__":
