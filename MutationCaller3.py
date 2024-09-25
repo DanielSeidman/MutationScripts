@@ -8,6 +8,8 @@ import sys
 import numpy
 from numpy import exp
 from numpy import log1p
+from numpy import finfo
+
 import concurrent.futures
 
 #TODO: Handle Phase and IBD uncertainty better
@@ -45,20 +47,24 @@ def ibd_probability(ibdKnown, phased, distance, baseLikelihood):
 #Output;
 def read_likelihood(focal_allele, node_of_read_origin, ibd_likelihood, descendant):
     if(descendant and (focal_allele==node_of_read_origin.allele)):
+        #print((1.0-node_of_read_origin.hidden_var_error)*ibd_likelihood+node_of_read_origin.hidden_var_error*ibd_likelihood)
         return (1.0-node_of_read_origin.hidden_var_error)*ibd_likelihood+node_of_read_origin.hidden_var_error*ibd_likelihood
     elif(descendant and (focal_allele!=node_of_read_origin.allele)):
+        #print((1.0-node_of_read_origin.hidden_var_error)*(1-ibd_likelihood)+(node_of_read_origin.hidden_var_error)*ibd_likelihood)
         return (1.0-node_of_read_origin.hidden_var_error)*(1-ibd_likelihood)+(node_of_read_origin.hidden_var_error)*ibd_likelihood
     elif((not descendant) and (focal_allele==node_of_read_origin.allele)):
+        #print((1.0-node_of_read_origin.hidden_var_error)*(1-ibd_likelihood)+(node_of_read_origin.hidden_var_error)*ibd_likelihood)
         return (1.0-node_of_read_origin.false_var_error)*(1-ibd_likelihood)+(node_of_read_origin.false_var_error)*ibd_likelihood
     else:#if(not descendent and (focal_allele!=node_of_read_origin.allele)
-        return (1-node_of_read_origin.false_var_error)
+        #print((1.0-node_of_read_origin.false_var_error))
+        return max((1.0-node_of_read_origin.false_var_error),finfo(float).tiny)
 
 #TODO: possibly set up cache memoization to take advantage of repeated calls. Needs to use non-recursive so that function calls can be separated from relative distance between nodes, making their output identical from repeated calls
 #Input:
 #Output
 def gatherLogLikelihood(viewed_ids, current_id, original_allele, original_id, original_haplotype, site, distance, descendent, outer_pedigree, inner_pedigree, seg_structure, ibd_error_rate):
     #EndCase, prevents redundent analysis
-    if (current_id == -1 or current_id in viewed_ids):
+    if (current_id == -1 or current_id == "0" or current_id in viewed_ids):
         return 0.0
     viewed_ids.add(current_id)
     log_likelihood = 0.0
@@ -94,7 +100,7 @@ def gather_likelihoods_for_variants(contig_iterator, outer_tree, seg_first_order
                 inner_tree = InnerTree(site_record)#builds a site-specific inner tree structure from the genotype calls at this site
                 likelihoods = []
                 likelihoods_to_print = str(site_record.POS)
-                structure.updateSegs(site_record.POS)
+                structure.update_segs(site_record.POS)
                 for sample in site_record.samples:
 
                     viewed_ids = set()
@@ -191,7 +197,7 @@ class SegSiteStructure:
         return line
 
     #Checks what segments overlap with current cite, adds and removes tracked segments as needed
-    def updateSegs(self, site):
+    def update_segs(self, site):
         last_ordered_line = self.peek_line_last()
         # Moves to first potentially overlapping segment, and attempts removal of any segments that no longer overlap after site update.
         while (last_ordered_line):
@@ -231,13 +237,16 @@ class OuterNode:
         self.name = name
         self.parents = set()
         self.children = set()
-
+        self.parents.add(mother)
+        self.parents.add(father)
 
     def add_child(self, child_name):
         self.children.add(child_name)
 
     def add_parent(self, parent_name):
         self.parents.add(parent_name)
+
+
 
 #Site, sample, and haplotype specific node class with depth and allele data. Remade for each site analyzed.
 #Represents a haplotype for a specific sample, and its allele controls what allele reads associated with it show for matching purposes
@@ -278,6 +287,7 @@ class InnerTree:
             gq_value = input_call.data.GQ
             pl_values=[gq_value, gq_value, gq_value]
             pl_values[input_call.gt_type]=0#The GQ value is, in practice, the difference between the two most likely PL values, so the correct genotype should have a PL of zero, and the others should have GQ or higher.
+        #print(pl_values)
         if(input_call.gt_type==0):
             node = InnerNode(0, depth_values[0]/2, pl_values[1], pl_values[2])
             self.map_to_inner_nodes[name][0] = node
@@ -314,12 +324,16 @@ class OuterTree:
     #Does NOT check consistency for sex in input.
     def load_tree(self, treeFileName):
         with open(treeFileName) as treeFile:
-            self.sampleCount = 0
-            self.trueSampleCount = 0
+            childrenToAdd = defaultdict(lambda: set())
             for line in treeFile:
                 tokens = line.split()
                 self.samples[tokens[0]] = OuterNode(tokens[0],tokens[1],tokens[2])
-
+                childrenToAdd[tokens[1]].add(tokens[0])
+                childrenToAdd[tokens[2]].add(tokens[0])
+            for sample in childrenToAdd:
+                if(sample != "0"):#Avoids treating unknown parents as a sample
+                    for child in childrenToAdd[sample]:
+                        self.samples[sample].add_child(child)
 
 #input:
 #vcf_reader; iterator for the entire input
